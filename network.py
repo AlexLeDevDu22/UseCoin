@@ -1,22 +1,27 @@
 from flask import Flask, request, jsonify
+import requests
 
 from common import *
 from miner import Miner
+from checker import *
 
 PEERS = []
 
 class Server:
-    def __init__(self, port, peers, blockchain, mine):
+    def __init__(self, port, blockchain, mine, my_id):
         self.app = Flask(__name__)
         self.blockchain = blockchain
         self.port = port
 
         self.miner = None
         if mine:
-            self.miner = Miner(blockchain, str(uuid.uuid4()), self)
+            self.miner = Miner(blockchain, my_id)
 
-        @self.app.route("/submit-job", methods=["POST"])
-        def submit_job():
+        @self.app.route("/share-job", methods=["POST"])
+        def receive_job():
+            if check_job(blockchain, request.get_json()["job_id"]).success:
+                broadcast_peers(request.get_json(),"share-job", "Job") # spreading job to peers
+
             if not self.miner:
                 return jsonify({"error": "Server is not a miner"}), 400
             data = request.get_json()
@@ -32,50 +37,42 @@ class Server:
             return jsonify({"status": "job added", "job_id": job.job_id})
         
 
-        @self.app.route("/receive-block", methods=["POST"])
+        @self.app.route("/share-block", methods=["POST"])
         def receive_block():
             data = request.get_json()
             # On reconstruit un bloc (simplifié pour MVP)
-            try:
-                dummy_job = LLMJob("external", seed=0)
-                dummy_job.job_id = data["job_id"]
-                dummy_job.prompt_hash = data["prompt_hash"]
+            new_block = Block.from_dict(data)
 
-                new_block = Block(
-                    previous_hash=data["previous_hash"],
-                    llm_job=dummy_job,
-                    result=data["result_excerpt"],
-                    result_hash=data["result_hash"],
-                    miner_id=data["miner"]
-                )
-                new_block.timestamp = data["timestamp"]
-                new_block.block_hash = data["block_hash"]
-
-                success = blockchain.add_block(new_block)
-                if success:
-                    print("[✓] Bloc reçu et ajouté !")
-                else:
-                    print("[x] Bloc déjà existant ou invalide.")
+            success = blockchain.add_block(new_block)
+            if success:
+                share_block(new_block)
                 return jsonify({"status": "ok"}), 200
-            except Exception as e:
-                return jsonify({"error": str(e)}), 400
+            else:
+                return jsonify({"error": "Block already exists"}), 202
             
         @self.app.route("/blockchain", methods=["GET"])
         def send_blockchain():
-            chain_data = []
-            for block in self.blockchain.chain:
-                chain_data.append({
-                    "block_hash": block.block_hash,
-                    "job_id": block.llm_job.job_id,
-                    "result": block.result[:200],
-                    "result_hash": block.result_hash,
-                    "miner": block.miner_id,
-                    "timestamp": block.timestamp,
-                    "previous_hash": block.previous_hash
-                })
-            print("sending blockchain data: ", chain_data)
-            return jsonify(chain_data)
+            print(info_c("Sharing blockchain"))
+            return blockchain.to_dict(), 200
 
+        @self.app.route("/balances", methods=["GET"])
+        def get_balances():
+            return jsonify(blockchain.balances), 200
+        
+        @self.app.route("/share-transaction", methods=["POST"])
+        def receive_transaction():
+            data = request.get_json()
+            sender = data.get("sender")
+            receiver = data.get("receiver")
+            amount = data.get("amount")
+            tx_id = data.get("tx_id")
+            result = blockchain.process_transactions(sender, receiver, amount,share_transaction, tx_id)
+            if result.success:
+                print(success_c(f"Transaction received. Sender: {sender}, Receiver: {receiver}, Amount: {amount}"))
+            else:
+                print(warning_c(f"Transaction received but rejected. Error: {result.message}"))
+            return result.message, result.code
+            
 
         threading.Thread(target=self.start).start()
         time.sleep(0.5)
@@ -83,38 +80,46 @@ class Server:
     def start(self):
         self.app.run(host="0.0.0.0", port=self.port)
 
-def add_block(block: Block):
-    block_data = {
-        "timestamp": block.timestamp,
-        "miner": block.miner_id,
-        "job_id": block.llm_job.job_id,
-        "prompt_hash": block.llm_job.prompt_hash,
-        "result_hash": block.result_hash,
-        "result_excerpt": block.result[:200],
-        "block_hash": block.block_hash,
-        "previous_hash": block.previous_hash
-    }
-
+def broadcast_peers(json_data,uri, elem):
     for peer in PEERS:
         try:
-            res = requests.post(f"http://localhost:{peer}/receive-block", json=block_data)
+            res = requests.post(f"http://localhost:{peer}/{uri}", json=json_data)
             if res.status_code == 200:
-                print(f"[+] Bloc envoyé à {peer}")
-                return True
+                print(info_c(f"[+] {elem} sent to {peer}"))
             else:
-                print(f"[!] Erreur envoi à {peer} : {res.status_code}")
+                if res.status_code != 202:
+                    print(error_c(f"[!] Error sending {elem} to {peer} : {res.status_code}"))
+                
         except Exception as e:
-            print(f"[!] Impossible d'envoyer à {peer} : {e}")
-        return False
+            print(error_c(f"[!] Error connecting to peer {peer}: {e}"))
+
+def share_block(block: Block):
+    block_data = block.to_dict()
+    broadcast_peers(block_data,"share-block", "Block")
     
+def share_transaction(sender, receiver, amount, tx_id):
+    transaction_data = {
+        "sender": sender,
+        "receiver": receiver,
+        "amount": amount,
+        "tx_id": tx_id
+    }
+
+    broadcast_peers(transaction_data,"share-transaction", "Transaction")
+
+def submit_job(job: LLMJob):
+    job_data = job.to_dict()
+
+    broadcast_peers(job_data,"share-job", "Job")
+
 def init_blockchain():
     try:
         blockchain = requests.get(f"http://localhost:{PEERS[0]}/blockchain").json()
-        print("blockchain received from peer:", blockchain)
-        return Blockchain(blockchain)
+        print(info_c("Blockchain received from peer:"), success_c(blockchain))
+        return Blockchain().from_dict(blockchain)
     except Exception as e:
         if e.__class__.__name__ == "ConnectionError":
-            print(f"[!] Impossible de communiquer avec le peer {PEERS[0]}")
+            print(error_c(f"[!] Impossible de communiquer avec le peer {PEERS[0]}"))
         else:
             raise f"[!] Erreur lors de la communication avec le peer {e}"
         return Blockchain()

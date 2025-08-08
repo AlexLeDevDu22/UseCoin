@@ -1,12 +1,12 @@
 from common import *
+
 import ollama
 import network
 
 class Miner:
-    def __init__(self, blockchain: Blockchain, miner_id: str, server):
+    def __init__(self, blockchain: Blockchain, my_id: str):
         self.blockchain = blockchain
-        self.miner_id = miner_id
-        self.server = server
+        self.my_id = my_id
 
     def execute_llm_job(self, job: LLMJob) -> str:
         """
@@ -26,18 +26,20 @@ class Miner:
             return f"[ERROR] LLM execution failed: {e}"
         
     def mine(self, job: LLMJob):
-        print(f"[Miner {self.miner_id}] Traitement du job: {job.job_id}...")
+        print(info_c(f"[Miner {self.my_id}] Traitement du job: {job.job_id}..."))
         result = self.execute_llm_job(job)
-        print(f"[Miner {self.miner_id}] Résultat obtenu: {result[:200]}...")
+        print(success_c(f"[Miner {self.my_id}] Résultat obtenu: {result[:200]}..."))
         result_hash = hashlib.sha256(result.encode()).hexdigest()
-        block = Block(self.blockchain.get_last_hash(), job, result[:200], result_hash, self.miner_id)
+        block = Block(self.blockchain.get_last_hash(), job, result[:200], result_hash, self.my_id, [])
+        
         success = self.blockchain.add_block(block)
+        print(success_c(f"[Miner {self.my_id}] Bloc ajouté à la blockchain: {block.block_hash}\n"))
         if success:
-            resuccess = network.add_block(block)
+            resuccess = network.share_block(block)
             if resuccess:
-                print(f"[Miner {self.miner_id}] Bloc ajouté à la blockchain: {block.block_hash}\n")
+                print(success_c(f"[Miner {self.my_id}] Bloc partagé: {block.block_hash}\n"))
             else:
-                print(f"[Miner {self.miner_id}] Bloc rejeté (job déjà traité).")
+                print(error_c(f"[Miner {self.my_id}] Bloc rejeté."))
         else:
-            print(f"[Miner {self.miner_id}] Job déjà traité. Bloc rejeté.\n")
+            print(error_c(f"[Miner {self.my_id}] Job déjà traité. Bloc rejeté.\n"))
             
