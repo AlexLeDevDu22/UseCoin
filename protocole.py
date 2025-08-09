@@ -6,6 +6,7 @@ import configparser
 import json
 
 from checker import *
+from PoUW import *
 
 # --- CONFIGURATION ---
 config = configparser.ConfigParser()
@@ -13,14 +14,17 @@ config.read('config.ini')
 
 # --- STRUCTURES ---
 class LLMJob:
-    def __init__(self, prompt, model=config["TEST"]["OLLAMA_MODEL"], seed=None, client_id=None, claimed=False, job_id=None, prompt_hash=None):
-        self.job_id = job_id or str(uuid.uuid4())
+    def __init__(self, prompt, client_id, public_key, model=config["TEST"]["OLLAMA_MODEL"], seed=uuid.uuid4().int, claimed=False, job_id=str(uuid.uuid4()), crypted_response=None, miner_id=None, response_timestamp=None):
+        self.job_id = job_id
         self.prompt = prompt
         self.model = model
         self.seed = seed
-        self.prompt_hash = prompt_hash or hashlib.sha256(prompt.encode()).hexdigest()
         self.claimed = claimed
         self.client_id = client_id
+        self.public_key = public_key
+        self.crypted_response = crypted_response
+        self.response_timestamp = response_timestamp
+        self.miner_id = miner_id
 
     def to_dict(self):
         return {
@@ -28,66 +32,60 @@ class LLMJob:
             "prompt": self.prompt,
             "model": self.model,
             "seed": self.seed,
-            "prompt_hash": self.prompt_hash,
             "claimed": self.claimed,
-            "client_id": self.client_id
+            "client_id": self.client_id,
+            "public_key": self.public_key,
+            "crypted_response": self.crypted_response,
+            "response_timestamp": self.response_timestamp,
+            "miner_id": self.miner_id
         }
 
 class Block:
-    def __init__(self, previous_hash=None, llm_job=None, result=None, result_hash=None, miner_id=None, transactions=[]):
-        self.timestamp = time.time()
+    def __init__(self, previous_hash, jobs, miner_id, transactions, timestamp, block_hash=None):
+        self.timestamp = timestamp
         self.previous_hash = previous_hash
-        self.llm_job = llm_job
-        self.result = result
-        self.result_hash = result_hash
+        self.jobs = jobs  # list of LLMJob
         self.miner_id = miner_id
         self.transactions = transactions
-        self.block_hash = self.compute_hash()
+        self.block_hash = block_hash or self.compute_hash()
 
     @classmethod
     def from_dict(cls, data):
         # Reconstruire le LLMJob du bloc
-        llm_job = LLMJob(**data["llm_job"]) if isinstance(data["llm_job"], dict) else data["llm_job"]
+        jobs = [LLMJob(**job) for job in data["jobs"]]
         # Reconstruire les transactions
         transactions = [Transaction.from_dict(tx) for tx in data.get("transactions", [])]
         block = cls(
             previous_hash=data.get("previous_hash"),
-            llm_job=llm_job,
-            result=data.get("result"),
-            result_hash=data.get("result_hash"),
+            jobs=jobs,
             miner_id=data.get("miner_id"),
-            transactions=transactions
+            transactions=transactions,
+            block_hash=data.get("block_hash"),
+            timestamp = data.get("timestamp")
         )
-        block.timestamp = data.get("timestamp", time.time())
-        block.block_hash = data.get("block_hash")
         return block
     
     def to_dict(self):
         return {
             "timestamp": self.timestamp,
             "previous_hash": self.previous_hash,
-            "llm_job": vars(self.llm_job),  # ou self.llm_job.to_dict() si tu ajoutes cette méthode
-            "result": self.result,
-            "result_hash": self.result_hash,
+            "jobs": [job.to_dict() for job in self.jobs],
             "miner_id": self.miner_id,
             "transactions": [tx.to_dict() for tx in self.transactions],
             "block_hash": self.block_hash
         }
-
-    def compute_hash(self):
-        if None not in [self.timestamp, self.previous_hash, self.llm_job, self.result_hash, self.miner_id, self.transactions]:
-            block_string = json.dumps({
-                "timestamp": self.timestamp,
-                "prompt_hash": self.llm_job.prompt_hash,
-                "result_hash": self.result_hash,
-                "previous_hash": self.previous_hash,
-                "miner_id": self.miner_id,
-                "transactions": [tx.to_dict() for tx in self.transactions]
-            }, sort_keys=True).encode()
-            return hashlib.sha256(block_string).hexdigest()
-        return None
-        
     
+    def compute_hash(self):
+        hash_dict = {
+            "timestamp": self.timestamp,
+            "previous_hash": self.previous_hash,
+            "jobs": [job.to_dict() for job in self.jobs],
+            "miner_id": self.miner_id,
+            "transactions": [tx.to_dict() for tx in self.transactions]
+        }
+        block_string = json.dumps(hash_dict, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
 class Transaction:
     def __init__(self, sender, receiver, amount, tx_id):
         self.tx_id = tx_id
@@ -119,7 +117,7 @@ class Blockchain:
     def __init__(self):
         self.lock = threading.Lock()
         self.chain = []
-        self.mempool = []
+        self.mempool = {"transactions": [], "jobs": []}
         self.balances = {}  # wallet_id -> UCO balance
         if len(self.chain) == 0:
             self.init_genesis_block()
@@ -131,8 +129,9 @@ class Blockchain:
         # Reconstruire la chaîne de blocs
         blockchain.chain = [Block.from_dict(b) for b in data.get("chain", [])]
         # Reconstruire la mempool
-        blockchain.mempool = [LLMJob(**j) for j in data.get("mempool", [])]
-        # Reconstruire les soldes
+        blockchain.mempool["transactions"] = [Transaction.from_dict(tx) for tx in data["mempool"]["transactions"]]
+        blockchain.mempool["jobs"] = [LLMJob(**j) for j in data["mempool"]["jobs"]]
+        # Reconstruire les soldess
         blockchain.balances = data.get("balances", {})
         # Reconstrauire les transactions
         blockchain.transactions = [Transaction.from_dict(tx) for tx in data.get("transactions", [])]
@@ -142,24 +141,25 @@ class Blockchain:
     def to_dict(self):
         return {
             "chain": [block.to_dict() for block in self.chain],
-            "mempool": [vars(job) for job in self.mempool],  # ou job.to_dict() si tu ajoutes cette méthode à LLMJob
+            "mempool": {
+                "transactions": [tx.to_dict() for tx in self.mempool["transactions"]],
+                "jobs": [job.to_dict() for job in self.mempool["jobs"]]
+            },
             "balances": self.balances
         }
 
     def init_genesis_block(self):
-        genesis_job = LLMJob("Genesis block")
-        block = Block("0" * 64, genesis_job, "Genesis result", hashlib.sha256(b"Genesis result").hexdigest(), "GENESIS", [])
+        block = Block("0" * 64, [], "GENESIS", [], time.time())
         self.chain.append(block)
 
     def add_block(self, block):
         with self.lock:
-            # Check if job already processed
-            for b in self.chain:
-                if b.llm_job.job_id == block.llm_job.job_id:
-                    return False
             self.chain.append(block)
+            self.empty_mempool()
             print(success_c(f"[✓] Bloc num {len(self.chain)} ajouté avec succès: {block.block_hash}"))
             self.reward_miner(block.miner_id)
+            if len(self.chain) % config["TEST"]["DIFF_ADJUST_INTERVAL"] == 0:
+                adjust_difficulty(self)
 
             return True
 
@@ -169,9 +169,6 @@ class Blockchain:
     def get_last_hash(self):
         return self.chain[-1].block_hash
 
-    def add_job_to_mempool(self, job):
-        self.mempool.append(job)
-
     def fetch_unclaimed_job(self):
         with self.lock:
             for job in self.mempool:
@@ -180,10 +177,15 @@ class Blockchain:
                     return job
         return None
     
+    def empty_mempool(self):
+        self.mempool["transactions"] = []
+        self.mempool["jobs"] = []
+    
     def reward_miner(self, miner_id):
+        print(success_c(f"[✓] Rewarding miner {miner_id}"))
         self.balances[miner_id] = self.balances.get(miner_id, 0) + int(config["TEST"]["REWARD_AMOUNT"])
 
-    def init_transactions(self):
+    def init_balances(self):
         for block in self.chain:
             for tx in block.transactions:
                 self.balances[tx.sender] = self.balances.get(tx.sender, 0) - tx.amount
@@ -193,7 +195,7 @@ class Blockchain:
         checking = check_transaction(self, sender, receiver, amount, tx_id)
         if checking.success:
             print(success_c(f"Transaction accepted. Sender: {sender}, Receiver: {receiver}, Amount: {amount}"))
-            self.get_last_block().transactions.append(Transaction(sender, receiver, amount, tx_id))
+            self.mempool["transactions"].append(Transaction(sender, receiver, amount, tx_id))
             self.balances[sender] = self.balances.get(sender, 0) - amount
             self.balances[receiver] = self.balances.get(receiver, 0) + amount
 
@@ -202,8 +204,19 @@ class Blockchain:
             if checking.code != 202:
                 print(warning_c(f"Transaction rejected. Error: {checking.message}"))
         return checking
-
-
+    
+    def compute_hash_mempool(self, timestamp, miner_id, difficulty):
+        mempool_ = {
+            "previous_hash": self.get_last_hash(),
+            "timestamp": timestamp,
+            "miner_id": miner_id,
+            "difficulty": difficulty,
+            "transactions": [tx.to_dict() for tx in self.mempool["transactions"]],
+            "jobs": [job.to_dict() for job in self.mempool["jobs"]]
+        }
+        block_string = json.dumps(mempool_, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+        
 
 # LOGS UTILS
 def error_c(text):

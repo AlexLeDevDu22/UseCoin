@@ -5,3 +5,5 @@ pour avoir un appercu:
 - lancer 2 shells
   Shell 1:>>> python3 main.py prompter --port 5000 --peers 5001 #le shell qui va requester
   Shell 2:>>> python3 main.py miner --port 5001 --peers 5000 #le shell qui va miner, utilisant le LLM
+
+#TODO: il faudra prouver qu'on est le mineur qui valide le bloc en checkant si le mineur-id est le meme que le dernier job rempli

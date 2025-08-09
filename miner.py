@@ -1,4 +1,6 @@
-from common import *
+from protocole import *
+from crypting import encrypt_job_result
+import PoUW
 
 import ollama
 import network
@@ -25,21 +27,22 @@ class Miner:
         except Exception as e:
             return f"[ERROR] LLM execution failed: {e}"
         
-    def mine(self, job: LLMJob):
+    def mine(self, job: LLMJob, blockchain: Blockchain):
         print(info_c(f"[Miner {self.my_id}] Traitement du job: {job.job_id}..."))
         result = self.execute_llm_job(job)
         print(success_c(f"[Miner {self.my_id}] Résultat obtenu: {result[:200]}..."))
-        result_hash = hashlib.sha256(result.encode()).hexdigest()
-        block = Block(self.blockchain.get_last_hash(), job, result[:200], result_hash, self.my_id, [])
-        
-        success = self.blockchain.add_block(block)
-        print(success_c(f"[Miner {self.my_id}] Bloc ajouté à la blockchain: {block.block_hash}\n"))
-        if success:
-            resuccess = network.share_block(block)
-            if resuccess:
-                print(success_c(f"[Miner {self.my_id}] Bloc partagé: {block.block_hash}\n"))
-            else:
-                print(error_c(f"[Miner {self.my_id}] Bloc rejeté."))
-        else:
-            print(error_c(f"[Miner {self.my_id}] Job déjà traité. Bloc rejeté.\n"))
-            
+
+        job.crypted_response = encrypt_job_result(result, job.public_key)
+        job.miner_id = self.my_id
+        timestamp = time.time()
+        job.response_timestamp = timestamp
+
+        if check_job(self.blockchain, job).success:
+            network.share_job(self.blockchain, job)
+            self.blockchain.mempool["jobs"].append(job)
+
+            if PoUW.reward_job(self.blockchain, self.my_id, timestamp):
+                print("JOB REWARDED!!!!!!!!")
+                network.block_validation(blockchain, job)
+
+            return job
